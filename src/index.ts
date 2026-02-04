@@ -47,36 +47,81 @@ function handleWhoAmI(request: Request, url: URL): Response {
 }
 
 async function handleFetch(url: URL): Promise<Response> {
-	const target = url.searchParams.get("url");
-	if (!target) {
+	const targetUrl = getValidatedHttpsUrl(url);
+	if (!targetUrl) {
 		return jsonError(
 			"bad_request",
-			'Missing query param "url". Example: /fetch?url=https://example.com',
+			'Missing/invalid "url". Example: /fetch?url=https://example.com',
 			400
 		);
 	}
+
+	const cache = caches.default;
+	const cacheKey = new Request(targetUrl.toString(), { method: "GET" });
+
+	const cached = await cache.match(cacheKey);
+	if (cached) return withHeader(cached, "X-Cache", "HIT");
+
+	const timed = await fetchWithTiming(targetUrl.toString());
+	if (!timed.ok) {
+		return jsonResponse(timed.errorBody, 502, { "X-Edge-Fetch-Ms": String(timed.elapsedMs) });
+	}
+
+	const body = await buildFetchSummary(
+		targetUrl.toString(),
+		timed.response,
+		timed.elapsedMs
+	);
+
+	const resp = jsonResponse(body, 200, {
+		"X-Edge-Fetch-Ms": String(timed.elapsedMs),
+		"X-Cache": "MISS",
+		"Cache-Control": "public, max-age=60",
+	});
+
+	await cache.put(cacheKey, resp.clone());
+	return resp;
+}
+
+function getValidatedHttpsUrl(url: URL): URL | null {
+	const target = url.searchParams.get("url");
+	if (!target) return null;
 
 	let targetUrl: URL;
 	try {
 		targetUrl = new URL(target);
 	} catch {
-		return jsonError("bad_request", "Invalid URL provided.", 400);
+		return null;
 	}
 
-	if (targetUrl.protocol !== "https:") {
-		return jsonError("bad_request", "Only https URLs are allowed.", 400);
-	}
+	if (targetUrl.protocol !== "https:") return null;
+	return targetUrl;
+}
 
+function withHeader(resp: Response, key: string, value: string): Response {
+	const headers = new Headers(resp.headers);
+	headers.set(key, value);
+	return new Response(resp.body, { status: resp.status, headers });
+}
+
+async function fetchWithTiming(
+	targetUrl: string
+): Promise<
+	| { ok: true; response: Response; elapsedMs: number }
+	| { ok: false; elapsedMs: number; errorBody: any }
+> {
 	const start = Date.now();
-
-	let upstream: Response;
 	try {
-		upstream = await fetch(targetUrl.toString());
+		const response = await fetch(targetUrl);
+		const elapsedMs = Date.now() - start;
+		return { ok: true, response, elapsedMs };
 	} catch (err) {
 		const elapsedMs = Date.now() - start;
-		return jsonResponse(
-			{
-				targetUrl: targetUrl.toString(),
+		return {
+			ok: false,
+			elapsedMs,
+			errorBody: {
+				targetUrl,
 				status: null,
 				elapsedMs,
 				contentType: null,
@@ -84,12 +129,11 @@ async function handleFetch(url: URL): Promise<Response> {
 				error: "upstream_fetch_failed",
 				message: err instanceof Error ? err.message : "Failed to fetch upstream URL.",
 			},
-			502,
-			{ "X-Edge-Fetch-Ms": String(elapsedMs) }
-		);
+		};
 	}
+}
 
-	const elapsedMs = Date.now() - start;
+async function buildFetchSummary(targetUrl: string, upstream: Response, elapsedMs: number) {
 	const contentType = upstream.headers.get("content-type") ?? null;
 
 	const previewable =
@@ -106,17 +150,13 @@ async function handleFetch(url: URL): Promise<Response> {
 		}
 	}
 
-	return jsonResponse(
-		{
-			targetUrl: targetUrl.toString(),
-			status: upstream.status,
-			elapsedMs,
-			contentType,
-			preview,
-		},
-		200,
-		{ "X-Edge-Fetch-Ms": String(elapsedMs) }
-	);
+	return {
+		targetUrl,
+		status: upstream.status,
+		elapsedMs,
+		contentType,
+		preview,
+	};
 }
 
 function jsonResponse(
