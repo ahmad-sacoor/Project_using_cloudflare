@@ -15,17 +15,36 @@ export default {
 	async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url);
 
+		if (request.method === "GET" && url.pathname === "/") {
+			return jsonResponse({
+				message: "Edge proxy running",
+				endpoints: {
+					whoami: "/whoami",
+					fetch: "/fetch?url=https://example.com",
+				},
+				notes: [
+					"/fetch caches responses for 60s (X-Cache HIT/MISS)",
+					"/fetch is rate-limited (20 requests/minute per client identifier)",
+				],
+			});
+		}
+
 		if (request.method === "GET" && url.pathname === "/whoami") {
 			return handleWhoAmI(request, url);
 		}
 
 		if (request.method === "GET" && url.pathname === "/fetch") {
+			// Apply rate limiting here (most important endpoint)
+			const limiter = checkRateLimit(request, 20, 60);
+			if (!limiter.allowed) {
+				return rateLimitedResponse(limiter.retryAfterSeconds);
+			}
 			return handleFetch(url);
 		}
 
 		return jsonError(
 			"not_found",
-			`No route for ${request.method} ${url.pathname}. Try /whoami or /fetch?url=https://example.com`,
+			`No route for ${request.method} ${url.pathname}. Try /, /whoami or /fetch?url=https://example.com`,
 			404
 		);
 	},
@@ -42,7 +61,7 @@ function handleWhoAmI(request: Request, url: URL): Response {
 		country: cf?.country ?? null,
 		colo: cf?.colo ?? null,
 		ipNote:
-			"Client IP is not guaranteed here. In production it may appear in trusted headers (e.g., CF-Connecting-IP), but local dev often won’t show it.",
+			"Client IP is not guaranteed. In production it may appear in trusted headers (e.g., CF-Connecting-IP), but local dev often won’t show it.",
 	});
 }
 
@@ -52,6 +71,16 @@ async function handleFetch(url: URL): Promise<Response> {
 		return jsonError(
 			"bad_request",
 			'Missing/invalid "url". Example: /fetch?url=https://example.com',
+			400
+		);
+	}
+
+	// Basic SSRF protection: block requests to localhost/private networks.
+	// This is important whenever you fetch arbitrary URLs provided by users.
+	if (isBlockedHost(targetUrl.hostname)) {
+		return jsonError(
+			"blocked_target",
+			"That target host is blocked for safety (localhost/private network).",
 			400
 		);
 	}
@@ -67,11 +96,7 @@ async function handleFetch(url: URL): Promise<Response> {
 		return jsonResponse(timed.errorBody, 502, { "X-Edge-Fetch-Ms": String(timed.elapsedMs) });
 	}
 
-	const body = await buildFetchSummary(
-		targetUrl.toString(),
-		timed.response,
-		timed.elapsedMs
-	);
+	const body = await buildFetchSummary(targetUrl.toString(), timed.response, timed.elapsedMs);
 
 	const resp = jsonResponse(body, 200, {
 		"X-Edge-Fetch-Ms": String(timed.elapsedMs),
@@ -79,6 +104,7 @@ async function handleFetch(url: URL): Promise<Response> {
 		"Cache-Control": "public, max-age=60",
 	});
 
+	// Store in edge cache for next time
 	await cache.put(cacheKey, resp.clone());
 	return resp;
 }
@@ -96,6 +122,25 @@ function getValidatedHttpsUrl(url: URL): URL | null {
 
 	if (targetUrl.protocol !== "https:") return null;
 	return targetUrl;
+}
+
+function isBlockedHost(hostname: string): boolean {
+	const host = hostname.toLowerCase();
+
+	if (host === "localhost" || host === "127.0.0.1" || host === "::1") return true;
+
+	// Block common private IP ranges (basic checks)
+	if (host.startsWith("10.")) return true;
+	if (host.startsWith("192.168.")) return true;
+
+	// 172.16.0.0 – 172.31.255.255
+	if (host.startsWith("172.")) {
+		const parts = host.split(".");
+		const second = Number(parts[1]);
+		if (!Number.isNaN(second) && second >= 16 && second <= 31) return true;
+	}
+
+	return false;
 }
 
 function withHeader(resp: Response, key: string, value: string): Response {
@@ -157,6 +202,62 @@ async function buildFetchSummary(targetUrl: string, upstream: Response, elapsedM
 		contentType,
 		preview,
 	};
+}
+
+/**
+ * Rate limiting (simple fixed-window).
+ * For a portfolio demo, an in-memory Map is fine.
+ * Tradeoff: it resets on cold starts and doesn't share state across multiple edge instances.
+ */
+const RATE_LIMIT_STORE = new Map<string, { windowStartMs: number; count: number }>();
+
+function checkRateLimit(request: Request, maxRequests: number, windowSeconds: number): {
+	allowed: boolean;
+	retryAfterSeconds: number;
+} {
+	const now = Date.now();
+	const windowMs = windowSeconds * 1000;
+
+	const key = clientKey(request);
+	const entry = RATE_LIMIT_STORE.get(key);
+
+	if (!entry || now - entry.windowStartMs >= windowMs) {
+		RATE_LIMIT_STORE.set(key, { windowStartMs: now, count: 1 });
+		return { allowed: true, retryAfterSeconds: 0 };
+	}
+
+	if (entry.count >= maxRequests) {
+		const retryAfterSeconds = Math.ceil((windowMs - (now - entry.windowStartMs)) / 1000);
+		return { allowed: false, retryAfterSeconds };
+	}
+
+	entry.count += 1;
+	RATE_LIMIT_STORE.set(key, entry);
+	return { allowed: true, retryAfterSeconds: 0 };
+}
+
+function clientKey(request: Request): string {
+	// Prefer a trusted IP header if present (in production).
+	// In local dev this may be missing. We fall back to a stable-ish fingerprint.
+	const ip =
+		request.headers.get("cf-connecting-ip") ||
+		request.headers.get("x-forwarded-for") ||
+		"no-ip";
+
+	const ua = request.headers.get("user-agent") ?? "no-ua";
+	const cf = (request as any).cf as { country?: string; colo?: string } | undefined;
+	const country = cf?.country ?? "no-country";
+	const colo = cf?.colo ?? "no-colo";
+
+	return `${ip}|${country}|${colo}|${ua}`;
+}
+
+function rateLimitedResponse(retryAfterSeconds: number): Response {
+	return jsonResponse(
+		{ error: "rate_limited", retryAfterSeconds },
+		429,
+		{ "Retry-After": String(retryAfterSeconds) }
+	);
 }
 
 function jsonResponse(
