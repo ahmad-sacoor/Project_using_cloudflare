@@ -11,9 +11,12 @@
  * Learn more at https://developers.cloudflare.com/workers/
  */
 
+let REQUEST_SEQ = 0;
+
 export default {
 	async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url);
+		let REQUEST_SEQ = 0;
 
 		if (request.method === "GET" && url.pathname === "/") {
 			return jsonResponse({
@@ -40,6 +43,10 @@ export default {
 				return rateLimitedResponse(limiter.retryAfterSeconds);
 			}
 			return handleFetch(url);
+		}
+
+		if (request.method === "GET" && url.pathname === "/ui") {
+			return htmlResponse(UI_HTML);
 		}
 
 		return jsonError(
@@ -178,6 +185,7 @@ async function fetchWithTiming(
 	}
 }
 
+
 async function buildFetchSummary(targetUrl: string, upstream: Response, elapsedMs: number) {
 	const contentType = upstream.headers.get("content-type") ?? null;
 
@@ -260,13 +268,11 @@ function rateLimitedResponse(retryAfterSeconds: number): Response {
 	);
 }
 
-function jsonResponse(
-	data: unknown,
-	status = 200,
-	extraHeaders: Record<string, string> = {}
-): Response {
+
+function jsonResponse(data: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
 	const headers = new Headers({
 		"Content-Type": "application/json; charset=utf-8",
+		"X-Debug-Req": String(REQUEST_SEQ),
 		...extraHeaders,
 	});
 	return new Response(JSON.stringify(data, null, 2), { status, headers });
@@ -275,3 +281,100 @@ function jsonResponse(
 function jsonError(code: string, message: string, status = 400): Response {
 	return jsonResponse({ error: code, message }, status);
 }
+
+function htmlResponse(html: string, status = 200): Response {
+	return new Response(html, {
+		status,
+		headers: { "Content-Type": "text/html; charset=utf-8" },
+	});
+}
+
+const UI_HTML = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Edge Proxy UI</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 16px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    input { flex: 1; min-width: 260px; padding: 10px; }
+    button { padding: 10px 14px; cursor: pointer; }
+    pre { background: #111; color: #eee; padding: 14px; border-radius: 10px; overflow: auto; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; margin-top: 14px; }
+    .muted { opacity: 0.7; }
+  </style>
+</head>
+<body>
+  <h1>Edge Proxy UI</h1>
+  <p class="muted">Calls your Worker endpoints: <code>/whoami</code> and <code>/fetch</code>.</p>
+
+  <div class="card">
+    <div class="row">
+      <button id="btnWhoami">Call /whoami</button>
+      <button id="btnFetch">Call /fetch</button>
+      <button id="btnSpam">Spam /fetch (rate limit demo)</button>
+    </div>
+
+    <div style="height: 10px;"></div>
+
+    <div class="row">
+      <input id="urlInput" value="https://example.com" />
+    </div>
+
+    <p class="muted">
+      Tip: run <code>/fetch</code> twice on the same URL to see caching (X-Cache HIT/MISS).
+    </p>
+  </div>
+
+  <div class="card">
+    <h3>Result</h3>
+    <div id="meta" class="muted"></div>
+    <pre id="out">{}</pre>
+  </div>
+
+<script>
+  const out = document.getElementById("out");
+  const meta = document.getElementById("meta");
+  const urlInput = document.getElementById("urlInput");
+
+  function setOutput(data, headers) {
+    out.textContent = JSON.stringify(data, null, 2);
+    const xCache = headers.get("x-cache");
+    const xMs = headers.get("x-edge-fetch-ms");
+    const retry = headers.get("retry-after");
+    meta.textContent =
+      "x-cache=" + (xCache || "-") +
+      " | x-edge-fetch-ms=" + (xMs || "-") +
+      " | retry-after=" + (retry || "-");
+  }
+
+  async function call(path) {
+    const resp = await fetch(path, { cache: "no-store" });
+    const data = await resp.json().catch(() => ({ error: "non_json_response" }));
+    setOutput(data, resp.headers);
+    return { resp, data };
+  }
+
+  document.getElementById("btnWhoami").onclick = () => call("/whoami");
+
+  document.getElementById("btnFetch").onclick = () => {
+    const u = encodeURIComponent(urlInput.value.trim());
+    return call("/fetch?url=" + u);
+  };
+
+  document.getElementById("btnSpam").onclick = async () => {
+    const u = encodeURIComponent(urlInput.value.trim());
+    for (let i = 0; i < 30; i++) {
+		const { resp } = await fetch("/fetch?url=" + u, { cache: "no-store" });
+      if (resp.status === 429) {
+        const data = await resp.json().catch(() => ({}));
+        setOutput(data, resp.headers);
+        break;
+      }
+      await new Promise(r => setTimeout(r, 100));
+    }
+  };
+</script>
+</body>
+</html>`;
